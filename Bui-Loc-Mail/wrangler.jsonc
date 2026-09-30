@@ -1,0 +1,41 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bui-loc-mail",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-30",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": [
+      "/api/*"
+    ]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mail",
+      "database_id": "f1f6b9b1-66c6-4d0e-b57b-3776fe3d6b82"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MAIL_STORAGE",
+      "bucket_name": "mail"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "APP_NAME": "Bui Loc Mail",
+    "MAIL_DOMAIN": "builoc.name.vn",
+    "OWNER_EMAIL": "builoc.contact@gmail.com",
+    "PRIMARY_MAILBOX": "lienhe@builoc.name.vn"
+  },
+  "routes": [
+    {
+      "pattern": "mail.builoc.name.vn",
+      "custom_domain": true
+    }
+  ]
+}
