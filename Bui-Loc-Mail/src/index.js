@@ -50,6 +50,7 @@ async function ensureSchema(env){
     CREATE TABLE IF NOT EXISTS managed_domains (id INTEGER PRIMARY KEY AUTOINCREMENT,domain TEXT NOT NULL UNIQUE COLLATE NOCASE,status TEXT NOT NULL DEFAULT 'configured',receive_enabled INTEGER NOT NULL DEFAULT 1,send_enabled INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS mail_templates (id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,name TEXT NOT NULL,subject TEXT NOT NULL DEFAULT '',body_html TEXT NOT NULL DEFAULT '',body_text TEXT NOT NULL DEFAULT '',category TEXT NOT NULL DEFAULT 'personal',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE);
     CREATE TABLE IF NOT EXISTS delivery_events (id INTEGER PRIMARY KEY AUTOINCREMENT,message_id INTEGER,provider TEXT NOT NULL DEFAULT 'resend',provider_message_id TEXT,event_type TEXT NOT NULL,detail_json TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE);
+    CREATE TABLE IF NOT EXISTS inbound_events (id INTEGER PRIMARY KEY AUTOINCREMENT,recipient TEXT NOT NULL,sender TEXT,subject TEXT,status TEXT NOT NULL DEFAULT 'received',detail TEXT,message_id INTEGER,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE SET NULL);
     CREATE INDEX IF NOT EXISTS idx_messages_mailbox_folder ON messages(mailbox_id,folder,created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id_header);
     CREATE INDEX IF NOT EXISTS idx_login_history_user_created ON login_history(user_id,created_at DESC);
@@ -60,12 +61,14 @@ async function ensureSchema(env){
     CREATE INDEX IF NOT EXISTS idx_labels_user ON labels(user_id,name);
     CREATE INDEX IF NOT EXISTS idx_mail_templates_user ON mail_templates(user_id,updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_delivery_events_message ON delivery_events(message_id,created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_inbound_events_created ON inbound_events(created_at DESC);
     INSERT OR IGNORE INTO settings(key,value_json) VALUES ('setup_completed','false'),('mail_domain','"builoc.name.vn"'),('app_name','"Bui Loc Mail"');
     INSERT OR IGNORE INTO managed_domains(domain,status,receive_enabled,send_enabled) VALUES('builoc.name.vn','configured',1,0);
   `);
   for(const [table,column,def] of [
     ['users','avatar_key','TEXT'],['users','allow_name_change','INTEGER NOT NULL DEFAULT 1'],['users','allow_avatar_change','INTEGER NOT NULL DEFAULT 1'],['users','allow_password_change','INTEGER NOT NULL DEFAULT 1'],['users','last_login_at','TEXT'],['users','cover_key','TEXT'],['users','profile_status',"TEXT NOT NULL DEFAULT 'available'"],['users','allow_signature_change','INTEGER NOT NULL DEFAULT 1'],['users','allow_theme_change','INTEGER NOT NULL DEFAULT 1'],
     ['sessions','ip','TEXT'],['sessions','user_agent','TEXT'],['sessions','last_seen_at','TEXT'],
+    ['user_preferences','accent',"TEXT NOT NULL DEFAULT 'blue'"],['user_preferences','font_scale',"INTEGER NOT NULL DEFAULT 100"],['user_preferences','radius',"TEXT NOT NULL DEFAULT 'rounded'"],['user_preferences','glass',"INTEGER NOT NULL DEFAULT 1"],['user_preferences','sidebar',"TEXT NOT NULL DEFAULT 'full'"],['user_preferences','list_width',"TEXT NOT NULL DEFAULT 'medium'"],['user_preferences','motion',"TEXT NOT NULL DEFAULT 'full'"],['user_preferences','compose_mode',"TEXT NOT NULL DEFAULT 'floating'"],
     ['messages','bcc_json','TEXT'],['compose_drafts','bcc_json',"TEXT NOT NULL DEFAULT '[]'"],['compose_drafts','body_html','TEXT'],['compose_drafts','sender_address','TEXT'],['compose_drafts','reply_to_message_id','INTEGER']
   ]) await ensureColumn(env,table,column,def);
   const configuredDomain=String(env.MAIL_DOMAIN||'builoc.name.vn').trim().toLowerCase();
@@ -78,6 +81,7 @@ async function ensureSchema(env){
     ]);
   }catch(e){console.warn('DEFAULT_CONFIG_SYNC_FAILED',{message:e?.message||String(e)})}
   if(env.RESEND_API_KEY){try{await env.DB.prepare(`UPDATE managed_domains SET send_enabled=1 WHERE lower(domain)=lower(?) AND status!='disabled'`).bind(configuredDomain).run()}catch{}}
+  try{await ensureOwnerPrimaryMailbox(env)}catch(e){console.warn('PRIMARY_MAILBOX_SELF_HEAL_FAILED',{message:e?.message||String(e)})}
   schemaReady=true;
 }
 
@@ -117,6 +121,36 @@ async function resolveMailbox(env,address){
   const direct=await env.DB.prepare(`SELECT mb.*,u.id owner_user_id,u.display_name owner_name FROM mailboxes mb JOIN users u ON u.id=mb.user_id WHERE lower(mb.address)=lower(?) AND mb.is_active=1 AND u.status='active' LIMIT 1`).bind(address).first();
   if(direct)return direct;
   try{return await env.DB.prepare(`SELECT mb.*,u.id owner_user_id,u.display_name owner_name FROM aliases a JOIN mailboxes mb ON mb.id=a.mailbox_id JOIN users u ON u.id=mb.user_id WHERE lower(a.address)=lower(?) AND a.is_active=1 AND mb.is_active=1 AND u.status='active' LIMIT 1`).bind(address).first()}catch{return null}
+}
+
+async function ensureOwnerPrimaryMailbox(env){
+  const address=normalizeEmail(env.PRIMARY_MAILBOX||'lienhe@builoc.name.vn');
+  if(!validEmail(address))return null;
+  let mailbox=await resolveMailbox(env,address);
+  if(mailbox)return mailbox;
+  const ownerEmail=normalizeEmail(env.OWNER_EMAIL||'builoc.contact@gmail.com');
+  const owner=await env.DB.prepare(`SELECT id,display_name FROM users WHERE lower(email)=lower(?) AND status='active' ORDER BY CASE role WHEN 'super_admin' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,id LIMIT 1`).bind(ownerEmail).first();
+  if(!owner?.id)return null;
+  const domain=address.split('@')[1]||'';
+  const managed=await env.DB.prepare(`SELECT id FROM managed_domains WHERE lower(domain)=lower(?) AND receive_enabled=1 LIMIT 1`).bind(domain).first();
+  if(!managed)return null;
+  await env.DB.prepare(`INSERT OR IGNORE INTO mailboxes(user_id,address,display_name,is_primary,is_active) VALUES(?,?,?,1,1)`).bind(owner.id,address,owner.display_name||'Bui Loc').run();
+  mailbox=await resolveMailbox(env,address);
+  if(mailbox){
+    try{await env.DB.prepare(`UPDATE mailboxes SET is_primary=CASE WHEN id=? THEN 1 ELSE 0 END WHERE user_id=?`).bind(mailbox.id,owner.id).run()}catch{}
+  }
+  return mailbox;
+}
+async function resolveInboundMailbox(env,address){
+  const recipient=normalizeEmail(address);
+  let mailbox=await resolveMailbox(env,recipient);
+  if(mailbox)return mailbox;
+  const primary=normalizeEmail(env.PRIMARY_MAILBOX||'lienhe@builoc.name.vn');
+  if(recipient===primary)return ensureOwnerPrimaryMailbox(env);
+  return null;
+}
+async function logInbound(env,{recipient,sender,subject,status,detail='',messageId=null}){
+  try{await env.DB.prepare(`INSERT INTO inbound_events(recipient,sender,subject,status,detail,message_id) VALUES(?,?,?,?,?,?)`).bind(recipient||'',sender||'',subject||'',status||'received',String(detail||'').slice(0,1000),messageId||null).run()}catch{}
 }
 
 function bytesToBase64(buffer){
@@ -316,7 +350,21 @@ async function routeApi(request,env){
   if(av&&request.method==='GET'){const t=await env.DB.prepare(`SELECT avatar_key FROM users WHERE id=?`).bind(Number(av[1])).first();if(!t?.avatar_key)return notFound();const o=await env.MAIL_STORAGE.get(t.avatar_key);if(!o)return notFound();const h=new Headers();o.writeHttpMetadata(h);h.set('cache-control','private,max-age=3600');return new Response(o.body,{headers:h})}
 
   if(path==='/api/preferences'&&request.method==='PATCH'){
-    if(user.allow_theme_change===0)return forbidden('Giao diện được quản lý bởi quản trị viên.');const b=await bodyJson(request),theme=['light','dark','system','sky'].includes(b.theme)?b.theme:'system',density=['comfortable','compact'].includes(b.density)?b.density:'comfortable',pane=['right','none'].includes(b.readingPane)?b.readingPane:'right';await env.DB.prepare(`INSERT INTO user_preferences(user_id,theme,density,reading_pane,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET theme=excluded.theme,density=excluded.density,reading_pane=excluded.reading_pane,updated_at=CURRENT_TIMESTAMP`).bind(user.id,theme,density,pane).run();return json({ok:true})
+    if(user.allow_theme_change===0)return forbidden('Giao diện được quản lý bởi quản trị viên.');
+    const b=await bodyJson(request);
+    const theme=['light','dark','system','sky'].includes(b.theme)?b.theme:'system';
+    const density=['comfortable','compact'].includes(b.density)?b.density:'comfortable';
+    const pane=['right','none'].includes(b.readingPane)?b.readingPane:'right';
+    const accent=['blue','cyan','indigo','teal'].includes(b.accent)?b.accent:'blue';
+    const fontScale=[90,100,110].includes(Number(b.fontScale))?Number(b.fontScale):100;
+    const radius=['compact','rounded','soft'].includes(b.radius)?b.radius:'rounded';
+    const glass=b.glass===false?0:1;
+    const sidebar=['full','compact'].includes(b.sidebar)?b.sidebar:'full';
+    const listWidth=['narrow','medium','wide'].includes(b.listWidth)?b.listWidth:'medium';
+    const motion=['full','reduced'].includes(b.motion)?b.motion:'full';
+    const composeMode=['floating','fullscreen'].includes(b.composeMode)?b.composeMode:'floating';
+    await env.DB.prepare(`INSERT INTO user_preferences(user_id,theme,density,reading_pane,accent,font_scale,radius,glass,sidebar,list_width,motion,compose_mode,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(user_id) DO UPDATE SET theme=excluded.theme,density=excluded.density,reading_pane=excluded.reading_pane,accent=excluded.accent,font_scale=excluded.font_scale,radius=excluded.radius,glass=excluded.glass,sidebar=excluded.sidebar,list_width=excluded.list_width,motion=excluded.motion,compose_mode=excluded.compose_mode,updated_at=CURRENT_TIMESTAMP`).bind(user.id,theme,density,pane,accent,fontScale,radius,glass,sidebar,listWidth,motion,composeMode).run();
+    return json({ok:true,preferences:{theme,density,reading_pane:pane,accent,font_scale:fontScale,radius,glass,sidebar,list_width:listWidth,motion,compose_mode:composeMode}})
   }
 
   if(path==='/api/directory'&&request.method==='GET'){
@@ -436,6 +484,16 @@ async function routeApi(request,env){
     await audit(env,user.id,'mail.deleted.permanently','message',id);return json({ok:true});
   }
 
+  if(path==='/api/inbound/diagnostics'&&request.method==='GET'){
+    if(!isAdmin(user))return forbidden('Chỉ quản trị viên được xem chẩn đoán nhận thư.');
+    const [events,mailboxes,domains]=await Promise.all([
+      env.DB.prepare(`SELECT id,recipient,sender,subject,status,detail,message_id,created_at FROM inbound_events ORDER BY id DESC LIMIT 30`).all(),
+      env.DB.prepare(`SELECT mb.id,mb.address,mb.is_primary,mb.is_active,u.email owner_email FROM mailboxes mb JOIN users u ON u.id=mb.user_id ORDER BY mb.is_primary DESC,mb.id`).all(),
+      env.DB.prepare(`SELECT domain,status,receive_enabled,send_enabled FROM managed_domains ORDER BY domain`).all()
+    ]);
+    return json({ok:true,worker:'bui-loc-mail',primaryMailbox:env.PRIMARY_MAILBOX||'lienhe@builoc.name.vn',events:events.results||[],mailboxes:mailboxes.results||[],domains:domains.results||[]})
+  }
+
   if(path.startsWith('/api/admin/')){
     if(!isAdmin(user))return forbidden();
     if(path==='/api/admin/dashboard'&&request.method==='GET'){
@@ -500,19 +558,24 @@ async function routeApi(request,env){
 
 
 async function handleInboundEmail(message, env, ctx) {
-  const recipient = String(message.to || '').trim().toLowerCase();
-  const sender = String(message.from || '').trim();
+  const recipient = normalizeEmail(message.to);
+  const sender = normalizeEmail(message.from) || String(message.from || '').trim();
+  const subject = message.headers.get('subject') || '(Không có tiêu đề)';
+  const messageId = message.headers.get('message-id') || null;
   try {
     await ensureSchema(env);
-    let mailbox = await env.DB.prepare(`SELECT mb.id,mb.user_id,mb.address FROM mailboxes mb JOIN users u ON u.id=mb.user_id WHERE lower(mb.address)=lower(?) AND mb.is_active=1 AND u.status='active' LIMIT 1`).bind(recipient).first();
+    await logInbound(env,{recipient,sender,subject,status:'accepted',detail:'Email Worker đã nhận sự kiện từ Cloudflare Email Routing.'});
+    const mailbox = await resolveInboundMailbox(env,recipient);
     if (!mailbox) {
-      try { mailbox = await env.DB.prepare(`SELECT mb.id,mb.user_id,mb.address FROM aliases a JOIN mailboxes mb ON mb.id=a.mailbox_id JOIN users u ON u.id=mb.user_id WHERE lower(a.address)=lower(?) AND a.is_active=1 AND mb.is_active=1 AND u.status='active' LIMIT 1`).bind(recipient).first(); } catch {}
+      await logInbound(env,{recipient,sender,subject,status:'rejected',detail:'Không tìm thấy mailbox/alias đang hoạt động cho người nhận.'});
+      console.warn('MAILBOX_NOT_FOUND',{from:sender,to:recipient,primaryMailbox:env.PRIMARY_MAILBOX||''});
+      message.setReject('Mailbox does not exist.');
+      return;
     }
-    if (!mailbox) { message.setReject('Mailbox does not exist.'); return; }
-    const subject = message.headers.get('subject') || '(Không có tiêu đề)';
-    const messageId = message.headers.get('message-id') || null;
-    if(messageId){const dup=await env.DB.prepare(`SELECT id FROM messages WHERE mailbox_id=? AND message_id_header=? LIMIT 1`).bind(mailbox.id,messageId).first();if(dup){console.log('MAIL_DUPLICATE_SKIPPED',{mailboxId:mailbox.id,messageId});return;}}
-    const sentAt = message.headers.get('date') || null;
+    if(messageId){
+      const dup=await env.DB.prepare(`SELECT id FROM messages WHERE mailbox_id=? AND message_id_header=? LIMIT 1`).bind(mailbox.id,messageId).first();
+      if(dup){await logInbound(env,{recipient,sender,subject,status:'duplicate',detail:'Message-ID đã tồn tại.',messageId:dup.id});console.log('MAIL_DUPLICATE_SKIPPED',{mailboxId:mailbox.id,messageId});return;}
+    }
     let folder='inbox', starred=0;
     try {
       const rules=await env.DB.prepare(`SELECT sender_contains,subject_contains,action_folder,action_star FROM mail_rules WHERE user_id=? AND is_active=1 AND (mailbox_id IS NULL OR mailbox_id=?) ORDER BY id ASC`).bind(mailbox.user_id,mailbox.id).all();
@@ -520,12 +583,18 @@ async function handleInboundEmail(message, env, ctx) {
     } catch {}
     const storageKey=`messages/inbound/${mailbox.id}/${Date.now()}-${crypto.randomUUID()}.eml`;
     const rawEmail=await new Response(message.raw).arrayBuffer();
-    await env.MAIL_STORAGE.put(storageKey,rawEmail,{httpMetadata:{contentType:'message/rfc822'},customMetadata:{recipient,sender}});
-    const result=await env.DB.prepare(`INSERT INTO messages(mailbox_id,direction,folder,message_id_header,sender,recipients_json,subject,preview,storage_key,raw_size,is_read,is_starred,status,sent_at,received_at) VALUES(?,'inbound',?,?,?,?,?,?,?, ?,0,?,'received',?,CURRENT_TIMESTAMP)`).bind(mailbox.id,folder,messageId,sender,JSON.stringify([recipient]),subject,'',storageKey,rawEmail.byteLength,starred,sentAt).run();
+    await env.MAIL_STORAGE.put(storageKey,rawEmail,{httpMetadata:{contentType:'message/rfc822'},customMetadata:{recipient,sender,messageId:messageId||''}});
+    const sentAtHeader=message.headers.get('date')||null;
+    let sentAt=null;
+    if(sentAtHeader){const d=new Date(sentAtHeader);sentAt=Number.isNaN(d.getTime())?null:d.toISOString()}
+    const result=await env.DB.prepare(`INSERT INTO messages(mailbox_id,direction,folder,message_id_header,sender,recipients_json,subject,preview,storage_key,raw_size,is_read,is_starred,status,sent_at,received_at) VALUES(?,'inbound',?,?,?,?,?,?,?,?,0,?,'received',?,CURRENT_TIMESTAMP)`).bind(mailbox.id,folder,messageId,sender,JSON.stringify([recipient]),subject,'',storageKey,rawEmail.byteLength,starred,sentAt).run();
+    const storedId=Number(result.meta?.last_row_id||0)||null;
+    await logInbound(env,{recipient,sender,subject,status:'stored',detail:`Đã lưu vào ${folder}.`,messageId:storedId});
     try{await env.DB.prepare(`INSERT INTO notifications(user_id,type,title,body) VALUES(?,'mail',?,?)`).bind(mailbox.user_id,`Thư mới từ ${sender}`,subject).run()}catch{}
-    console.log('MAIL_RECEIVED',{id:result.meta?.last_row_id,from:sender,to:recipient,subject,folder,storageKey,size:rawEmail.byteLength});
+    console.log('MAIL_RECEIVED',{id:storedId,from:sender,to:recipient,subject,folder,storageKey,size:rawEmail.byteLength});
   } catch (error) {
-    console.error('MAIL_RECEIVE_FAILED',{from:sender,to:recipient,message:error?.message||String(error)});
+    await logInbound(env,{recipient,sender,subject,status:'failed',detail:error?.message||String(error)});
+    console.error('MAIL_RECEIVE_FAILED',{from:sender,to:recipient,message:error?.message||String(error),stack:error?.stack||''});
     message.setReject('Temporary mail processing error.');
   }
 }
