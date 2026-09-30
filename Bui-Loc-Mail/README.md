@@ -1,4 +1,4 @@
-# Bui Loc Mail
+# Bui Loc Mail V1.0
 
 Hệ thống webmail cá nhân cho `builoc.name.vn`, chuyển đổi từ nền mail cũ thành một project độc lập. Một Cloudflare Worker xử lý website/API và Email Routing.
 
@@ -52,12 +52,12 @@ Mở `mail.builoc.name.vn`. Form setup được điền sẵn tên `Bui Loc` và
 
 Email Routing chỉ chuyển được thư tới Worker sau khi Worker đã tồn tại. Nếu trước deploy catch-all đang là Drop, sau deploy đổi destination sang Worker `bui-loc-mail`. Hộp thư/alias không tồn tại trong Bui Loc Mail sẽ bị Worker từ chối thay vì nhận nhầm.
 
-## Bản Modern Workspace — 30/09/2026
+## Bui Loc Mail V1.0 — 30/09/2026
 
 - Giao diện Login/Inbox/Reader/Compose/Settings dùng chung một design system Bui Loc Mail.
 - Màn đăng nhập không hiển thị tên miền hạ tầng.
-- Trình soạn mặc định là cửa sổ nổi; có thể chuyển toàn màn hình.
-- Tại **Tài khoản → Giao diện**, người dùng được phép có thể đổi theme, màu nhấn, mật độ, cỡ UI, bo góc, hiệu ứng kính, sidebar, độ rộng danh sách, chuyển động và kiểu trình soạn.
+- Trình soạn thư là một workspace toàn màn hình riêng, không phủ mờ Inbox và không còn lỗi cắt nội dung của cửa sổ nổi.
+- Tại **Tài khoản → Giao diện**, người dùng được phép có thể đổi theme, màu nhấn, mật độ, cỡ UI, bo góc, hiệu ứng kính, sidebar, độ rộng danh sách, khung đọc thư và chuyển động. Trình soạn kế thừa toàn bộ theme của tài khoản.
 - Tại **Tài khoản → Nhận thư** (Admin/Super Admin) có bảng chẩn đoán inbound. Nếu gửi thử mà không có sự kiện mới, Email Routing chưa chạy vào Worker `bui-loc-mail`.
 - Worker tự kiểm tra và khôi phục `PRIMARY_MAILBOX` cho Super Admin nếu D1 cũ chưa có địa chỉ này.
 - Thư đến được ghi trạng thái `accepted` → `stored` hoặc `rejected/failed` trong `inbound_events` để dễ xác định lỗi Routing/Worker/D1/R2.

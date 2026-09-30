@@ -14,3 +14,10 @@
 8. Xác nhận `lienhe@builoc.name.vn` xuất hiện và là hộp thư chính. Bản này tự khôi phục mailbox chính trên D1 cũ nếu cần.
 9. Gửi thử `lienhe@builoc.name.vn` → Gmail để kiểm tra Resend.
 10. Tài khoản → **Giao diện** để chọn theme/layout cá nhân; không cần sửa code.
+
+## V1.0 final
+
+- Trình soạn thư mở thành workspace riêng toàn màn hình; không còn lớp Inbox mờ phía sau.
+- Giao diện Compose kế thừa theme/màu nhấn/cỡ UI/bo góc của tài khoản.
+- `Tài khoản → Giao diện` dùng mục **Khung đọc thư** thay cho lựa chọn cửa sổ nổi/toàn màn hình.
+- Sau deploy nên hard refresh một lần để trình duyệt nhận CSS/JS V1 mới.
